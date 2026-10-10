@@ -1,0 +1,16 @@
+.DS_Store
+.venv/
+.env
+.env.*
+!.env.example
+.local/
+__pycache__/
+*.py[cod]
+*.sqlite3
+.pytest_cache/
+.ruff_cache/
+node_modules/
+dist/
+*.tsbuildinfo
+*.log
+.idea/
