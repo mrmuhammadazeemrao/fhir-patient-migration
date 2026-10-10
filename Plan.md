@@ -1,47 +1,87 @@
 # Patient and Observation Migration Plan
 
-Migrate approximately 50,000 FHIR R4 patients and their observations into an internal service, keeping the source read-only. Part 2 demonstrates a bounded synthetic sample from `https://hapi.fhir.org/baseR4` using Django, PostgreSQL, and Vue.
+This plan migrates ~50,000 patients and their Observations from a legacy FHIR R4 API into
+a new internal service. Sections 1–5 cover production, and section 6 is the Part 2 slice.
 
-## 1. Overall approach
+**Assumptions to confirm.** Legacy stays in clinical use, so protecting it matters more
+than speed. The new service is empty until cutover, and nothing writes to legacy. Plan for
+~600 Observations per patient (~30M rows) until a pilot measures it. Only Observations
+whose `subject` is a Patient are in scope.
 
-**Establish a consistent source.** Confirm searches, rate limits, volume, and migration window with the source owner. Use a consistent export or arrange a write freeze for REST extraction. A timestamp filter alone cannot preserve overwritten/deleted versions. Record the source, extraction window, and mapping version. Without consistency, report drift and reconcile before cutover.
+## 1. Approach
 
-**Extract, map, stage, validate, publish.** Use a restartable batch command outside web requests. Start with patient pages of 100; query `/Observation?subject=Patient/{id}` per patient. Follow `Bundle.link[relation=next]` for both resource types, processing one page at a time; `_count` limits page size, not total results. Persist a patient manifest with pending/completed/failed states and observation counts, saving discovery progress alongside manifest entries. If a cursor expires, restart discovery and deduplicate against the manifest.
+```text
+discover patients ─► extract per patient ─► map + validate ─► reconcile ─► delta + cutover
+  + manifest         → raw staging          → target          (gate)
+```
 
-**Control load and failures.** Start with two concurrent requests and a shared configurable rate cap agreed with the source owner. Reuse connections; set 5-second connect/30-second read timeouts. Allow four attempts for connection failures, timeouts, HTTP 429, and transient 5xx responses, with exponential backoff and jitter. Honor `Retry-After`; pause if it exceeds the retry budget. Stop for authentication/configuration errors, database outages, or sustained source failures. Invalid responses and missing/malformed resources are explicit failures, never empty results.
+If the source supports Bulk Data `$export`, use
+`Patient/$export?_type=Patient,Observation`. It is one async NDJSON job with a
+`transactionTime` cut-off. Otherwise, use throttled REST:
 
-**Make retries safe.** Stage each run separately, with unique `(run_id, source_system, resource_type, fhir_id)` keys; never merge people by name. Commit bounded database batches after network calls. Mark a patient complete only after its patient row and all observation pages are validated and saved. Retry failed patients without duplicates; never infer deletion from incomplete fetches.
+1. **Discover:** page through `Patient?_count=200` by following `Bundle.link` `next`, never computed offsets, because servers may return fewer than `_count`. Store raw Patients and `pending` manifest rows. If the cursor expires (HAPI returns 410), re-run the ~250 idempotent requests.
+2. **Extract per patient:** fetch all pages of `Observation?subject=Patient/{id}&_count=200`, then store them and mark the patient `extracted` in one transaction. The patient is the unit of checkpoint, retry and completeness, at the cost of at least one request per patient.
+3. **Map** staging into the target separately, so mapper fixes don't touch legacy. Rows are unique on `(source, resource_type, fhir_id)`, and every write is an upsert, so each step is safe to re-run.
 
-**Observe progress.** Record discovered/completed/failed patients, fetched/saved/rejected observations, retries, latency, and duration. Finish with a reconciliation report and nonzero exit status for unresolved failures. Log run IDs, counts, and error categories; restrict resource IDs and failure details.
+**API limits.** One process runs 4 workers that share a rate limiter set to the agreed
+rate. It runs off-peak, with 5 s connect and 30 s read timeouts, and makes no network
+calls inside DB transactions. The manifest table is the work queue, so no broker is needed.
+Estimate: ~150k requests, ~8 h at 5 req/s.
+
+**Failures.** A failed fetch never becomes "no observations".
+
+- **Transient** (timeouts, connection errors, 429, 502/503/504): up to 5 retries with exponential backoff and jitter. Honor `Retry-After`; pause the run beyond 5 min. An expired cursor restarts that patient.
+- **Item** (deleted patient, malformed resource, mapping error): mark the patient `failed` and continue.
+- **Fatal** (401/403, database down, more than 5% of requests failing over 5 min, or source latency at twice the pilot's): stop, alert, then resume from the manifest.
+
+**Observability.** Progress comes from the `migration_run` row (config, mapping version,
+timings) and manifest counts by state. JSON logs carry the run ID, internal key, attempt,
+latency and error category. Track throughput, 429 and retry rates, p95 latency and
+rejects by reason. A run exits non-zero if reconciliation leaves anything unresolved.
 
 ## 2. Data mapping
 
-Patient and Observation have internal IDs, a patient foreign key, source identity, run provenance, and `meta.versionId`/`meta.lastUpdated` when present.
+Mapping functions are pure and versioned, and each returns either a row or a reject with a
+reason. Missing values stay null. Nothing is guessed or silently dropped.
 
-| Resource | Internal fields and rules |
-| --- | --- |
-| Patient | `fhir_id`; display name from first official name, otherwise first usable name, joining all given names and family (text fallback); nullable gender; birth date as validated ISO text preserving year/month/day precision. Missing demographics remain missing. |
-| Observation | `fhir_id`; patient foreign key from `subject.reference`; status; coding system/code pairs and label (`code.text` fallback); typed value; units; effective time; components; absence reason. Resolve relative or same-source absolute patient references; reject unresolved/mismatched subjects. |
+- **Patient:** `fhir_id`, `mrn` (identifier type `MR`), `family_name` and `given_names` (the `official` name, else the first, else `text`), `gender`, `deceased`, `source_updated_at`. `birth_date` is stored as text so partial dates like `1980-06` keep their precision.
+- **Observation:** `patient_id`, where `subject` must reference this patient (relative, absolute or `_history` form) or the Observation is rejected. Every `status` is kept, `entered-in-error` included, so counts reconcile. Also `category`, `code` (LOINC coding, else first, else `code.text`; all codings kept as JSON), `effective` (original string plus UTC start/end) and `data_absent_reason`.
+- **Values:** `value_type` plus the value. Quantity is an exact decimal, never a float (R4 treats `0.010` ≠ `0.01`), with comparator and UCUM unit and no conversion. String, boolean, integer and code are text, where `0` and `false` are values. Range, Ratio, Period and `components` (e.g. blood pressure) are JSON. SampledData and Timing are rejected.
 
-Use normalized JSON for typed values and component results such as blood pressure. Preserve quantities as decimal text with comparator and unit/system/code; do not convert clinical units. Distinguish strings, integers, booleans, and coded values: zero and false are valid. Preserve effective date precision and period boundaries; retain `dataAbsentReason` for absent values. Unsupported variants and clinically significant modifiers require review and block completion, rather than silently becoming null. Store selected fields, not full FHIR payloads.
+Address, telecom and contacts are not migrated, to minimize data. Other fields can be
+added from staging before it expires. Patients with a `replaced-by` link are flagged
+for the data owner, never merged.
 
-## 3. Validation and acceptance
+## 3. Validation (cutover gate)
 
-- Check resource types, IDs, mapped fields, uniqueness, and patient relationships. No observations is valid; an observation-fetch failure is not equivalent.
-- Reconcile the stable source manifest against staged patient IDs and distinct observation IDs/counts per patient. Every resource must be saved or have a documented failure. `Bundle.total`, when confirmed accurate, is a cross-check, not proof of completeness. Publish with no unresolved failures or unexplained differences.
-- Compare 100 randomly selected patients and their observations against the same extraction: demographics, codes, units, statuses, missing values, and components.
-- Test partial dates, zero/false values, retry exhaustion, failed observation fetches, and duplicate-free reruns. Verify API/UI detail data and empty/error states.
+1. **Load:** mapper checks and database constraints. Every reject carries a reason code.
+2. **Completeness:** source Patient IDs must equal target ∪ rejected ∪ documented exclusions, as an exact set diff. Per patient, stored plus rejected Observations must equal fetched. `_summary=count` is only a cross-check, because `Bundle.total` is optional in R4 and the sandbox omits it by default.
+3. **Correctness:** diff a fresh source read against the internal API, field by field, for 300 random patients plus edge cases (no observations, components, partial dates). Zero mismatches bounds the per-patient error rate below ~1% at 95% confidence. The sample finds mapping bugs, and step 2 proves completeness.
+4. **Sign-off:** a clinical or data owner spot-checks ~20 records. The gate passes when nothing is unexplained and every reject is fixed or accepted.
 
-## 4. Safety
+## 4. PHI safety (real data)
 
-Use synthetic data throughout the exercise. For real PHI: authorized read-only source access, least-privilege destination access, TLS, encrypted storage/backups, managed secrets, and audited operator access. Keep PHI, raw identifiers, payloads, search URLs, and upstream error bodies out of ordinary logs, Git, and AI tools. Minimize storage and define staging/failure retention. Production access controls are outside the exercise implementation.
+- **Access:** run inside the approved network. The job only reads Patient and Observation, only writes to the target schema, gets secrets from a secret manager, and is run by named, audited operators.
+- **Storage:** TLS in transit. The database, staging and backups are encrypted. No copies go on laptops or into tickets, and any vendor handling PHI is under a BAA.
+- **Logs:** internal keys, counts and error categories only. Never names, DOB, values, payloads or URLs, because `?subject=Patient/123` exposes IDs and HTTP exceptions embed URLs. PHI-bearing errors stay in the access-controlled rejects table.
+- **Retention:** staging and rejects are deleted 30 days after sign-off, which limits the second PHI copy that lets us re-map without reloading legacy. Development uses synthetic data only.
 
-## 5. Rollback and recovery
+## 5. Rollback
 
-Keep candidate runs separate from the active dataset. On failure, stop scheduling, roll back unfinished transactions, preserve checkpoints, and retry incomplete patients after repair. Readers retain the previous dataset. After validation, atomically switch an active-run pointer; rollback switches it back. Retain the previous dataset through acceptance. For an initial load, hide the candidate. Discard failed staging after diagnosis. Run tags cannot restore overwritten rows; isolated candidates avoid overwrites.
+- **Before cutover:** nothing reads the target and legacy is untouched, so stopping is always safe. In-flight transactions roll back, and the manifest shows what finished. Resume, re-map from staging, or truncate the target, which started empty. Legacy is the fallback; no blue/green switch is needed.
+- **Cutover:** start a short legacy write freeze and take a delta with `_lastUpdated=gt<run start>` or `$export?_since=`. Deltas may miss deletions, so repeat the ID-set diff and gate, then switch.
+- **After cutover:** point consumers back at legacy, which stays readable for an agreed window. Any writes made in the new service would need replaying, so agree the point of no return up front.
 
-## 6. Part 2 boundary
+## 6. Part 2 slice
 
-Build a management command importing a small synthetic patient sample, persistence, `GET /api/patients/`, and `GET /api/patients/{id}/` with observations. Vue lists patients and opens their observations. Bound source responses and explicitly report truncation; do not claim a complete migration. Full traversal, manifests, and staged cutover belong to the scale plan. Exclude authentication, deployment, styling polish, real-time sync, and pagination features. Include meaningful backend tests, README instructions, AI-use notes, and limitations within the roughly three-hour budget.
+Built in ~2 hours on synthetic data to exercise mapping, failures, storage and reads; not a full migration.
 
-FHIR details checked against official R4 [search](https://hl7.org/fhir/R4/search.html), [Patient](https://hl7.org/fhir/R4/patient.html), [Observation](https://hl7.org/fhir/R4/observation.html), and [data types](https://hl7.org/fhir/R4/datatypes.html).
+- **Scope:** one synchronous `manage.py` command imports one page of `Patient?_count=20`, with up to 100 Observations each. It has no workers, rate limiter, manifest or staging. Pagination is excluded, so a `next` link is logged as truncation and not followed.
+- **Failures:** HTTPX timeouts, plus Tenacity retries (3 attempts, backoff with jitter) for timeouts, connection errors, 429 and 5xx. Other 4xx responses fail fast. A failed patient is skipped rather than saved without observations, and the command exits non-zero.
+- **Writes:** upsert by `fhir_id`, one transaction per patient, no deletes.
+- **Read path:** `GET /api/patients/` and `GET /api/patients/{id}/` (with observations, or 404). The Vue list opens a patient's observations. No auth, pagination or styling.
+- **Tests:** mapper edge cases (partial dates, components, `0`/`false`, `dataAbsentReason`, mismatched subject). Retries: 503, 503, then 200 succeeds; 404 is not retried; exhaustion skips the patient and exits non-zero. Re-import is idempotent, and an unknown patient returns 404.
+
+---
+
+Sources: R4 [search](https://hl7.org/fhir/R4/search.html), [Patient](https://hl7.org/fhir/R4/patient.html), [Observation](https://hl7.org/fhir/R4/observation.html), [datatypes](https://hl7.org/fhir/R4/datatypes.html), [references](https://hl7.org/fhir/R4/references.html) and [Bulk Data](https://hl7.org/fhir/uv/bulkdata/STU2/export.html); sandbox checked 2026-10-10.
